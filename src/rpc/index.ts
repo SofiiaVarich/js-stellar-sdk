@@ -14,3 +14,4 @@ export {
   parseRawQueryEvents,
 } from "./parsers.js";
 export * from "./transaction.js";
+export * from "./fees.js";
