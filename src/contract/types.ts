@@ -217,7 +217,10 @@ export type ClientOptions = {
  */
 export type MethodOptions = {
   /**
-   * The fee to pay for the transaction.
+   * The maximum inclusion fee bid, in stroops, for the single-operation
+   * contract transaction. This excludes the Soroban resource fee, which is
+   * supplied by simulation and added separately when assembling the transaction.
+   * This is a bid, not the fee actually charged after execution.
    * @defaultValue 100
    */
   fee?: string;

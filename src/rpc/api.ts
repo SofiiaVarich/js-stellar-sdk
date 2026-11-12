@@ -719,7 +719,9 @@ export namespace Api {
   }
 
   export interface GetFeeStatsResponse {
+    /** Inclusion-fee statistics for Soroban transactions; excludes resource fees. */
     sorobanInclusionFee: FeeDistribution;
+    /** Inclusion-fee statistics for classic (non-Soroban) transactions. */
     inclusionFee: FeeDistribution;
     latestLedger: number; // uint32
   }

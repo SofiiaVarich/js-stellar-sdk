@@ -29,14 +29,17 @@ is the recipient's public key (a `G...` string):
 
 <!-- snippet: send-a-payment.ts#build -->
 
-`fee` is the *maximum* per-operation fee you're willing to pay, in stroops
+`fee` is the _maximum_ per-operation fee you're willing to pay, in stroops
 (`BASE_FEE` is 100; one XLM is ten million stroops). It's a cap, not a fixed
-charge — the network only deducts what it actually needs at submission time, so
-a high `fee` (say, 5 XLM) makes the transaction more likely to be included when
-the network is busy without meaning all 5 XLM gets spent. `amount` is a string
-in whole units (`"100"` is 100 XLM). The
-destination must already exist on the network; to create and fund a brand-new
-account, use `Operation.createAccount` instead.
+charge — included transactions pay the network's clearing price, so a high `fee`
+(say, 5 XLM) makes the transaction more likely to be included when the network
+is busy without meaning all 5 XLM gets spent. `amount` is a string in whole
+units (`"100"` is 100 XLM). The destination must already exist on the network;
+to create and fund a brand-new account, use `Operation.createAccount` instead.
+
+`BASE_FEE` is the network minimum, not a recommended bid. See
+[Transaction Fees](/guides/08-transaction-fees/) for fetching fee statistics,
+capping your bid, and checking what was actually charged.
 
 ## Sign and submit
 
@@ -60,22 +63,22 @@ Many services (exchanges, custodians) require a memo to route a payment. Add a
 
 ## Send an issued asset
 
-To send an issued asset instead of XLM, pass an [`Asset`](/reference/core-assets/#asset)
-built from its code and the issuer account's public key (`issuerId`). Everything
-else is the same:
+To send an issued asset instead of XLM, pass an
+[`Asset`](/reference/core-assets/#asset) built from its code and the issuer
+account's public key (`issuerId`). Everything else is the same:
 
 <!-- snippet: send-a-payment.ts#issued-asset -->
 
 The destination must already trust this asset, otherwise the payment fails.
-Setting up an issuer and trustlines is covered in [Issue an Asset](/guides/03-issue-an-asset/).
+Setting up an issuer and trustlines is covered in
+[Issue an Asset](/guides/03-issue-an-asset/).
 
 ## Put it together
 
 The whole native-payment flow as one runnable script — the same code as the
 steps above, assembled. It funds a throwaway `source` and `destinationId` with
-friendbot so the example runs end to end; in your app, `source` is your
-existing funded account and `destinationId` is any account that already
-exists:
+friendbot so the example runs end to end; in your app, `source` is your existing
+funded account and `destinationId` is any account that already exists:
 
 <!-- snippet: send-a-payment.ts#full -->
 
