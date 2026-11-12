@@ -8,6 +8,16 @@ import { Server } from "../rpc/index.js";
 import { ScVal } from "../xdr/index.js";
 
 export type XDR_BASE64 = string;
+
+/** An authorization entry processed by {@link contract.AssembledTransaction.signAuthEntries}. */
+export interface AuthEntrySigningResult {
+  /** Zero-based index in the operation's authorization entries. */
+  index: number;
+  /** Top-level credential address selected for signing. */
+  address: string;
+  /** Expiration ledger passed to the authorizer. */
+  expiration: number;
+}
 /**
  * An unsigned 32-bit integer.
  */

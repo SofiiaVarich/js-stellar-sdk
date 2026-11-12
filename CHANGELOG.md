@@ -4,6 +4,9 @@ A breaking change will get clearly marked in this log.
 
 ## Unreleased
 
+### Breaking changes (v18)
+* `contract.AssembledTransaction.signAuthEntries()` allows re-signing already signed entries and returns an array of `{ index, address, expiration }` results. Calling it twice may prompt the wallet twice and refresh the expiration. It no longer throws `NoUnsignedNonInvokerAuthEntriesError`. Delegate-only addresses and addresses without matching top-level entries now throw `TypeError`, rather than `NoSignatureNeededError`; callers must not treat these errors as a signal to skip signing. Entries with signed delegates retain their stored expiration, including expired values, and reject an explicit different expiration before any signing callback runs. To change that expiration, obtain new delegate signatures. This behavior is intended for v18, not a v17 patch or minor release ([#1890](https://github.com/stellar/js-stellar-sdk/issues/1890)).
+
 ### Added
 * `inspectTransaction()` decodes a `Transaction` or `FeeBumpTransaction` into a typed summary to show before signing. The summary includes the source, memo, fees and each operation, with its Soroban authorization entries and top-level contract call. The function makes no network calls. A part that the SDK cannot decode becomes an `unreadable` node, and the rest of the summary stays complete ([#1881](https://github.com/stellar/js-stellar-sdk/pull/1881)).
 * `contract.Client.invoke(client, name, args?, options?)` builds a call to a contract function by its on-chain name, as the function's client method does. It also reaches a function that has no client method because its name is reserved or shared. `args` are always function arguments, never call options. It is a static method, so it takes no name that a contract function could use ([#1875](https://github.com/stellar/js-stellar-sdk/pull/1875)).

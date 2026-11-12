@@ -12,6 +12,7 @@ import {
 } from "../base/index.js";
 import type {
   AssembledTransactionOptions,
+  AuthEntrySigningResult,
   ClientOptions,
   MethodOptions,
   SignAuthEntry,
@@ -62,9 +63,10 @@ import {
   ScVal,
   SorobanAuthorizationEntry,
   SorobanCredentials,
+  SorobanDelegateSignature,
   SorobanTransactionData,
 } from "../xdr/index.js";
-import { getAddressCredentials } from "../base/auth.js";
+import { getAddressCredentials, signaturePresent } from "../base/auth.js";
 import { base64ToUint8Array } from "../base/util/base64.js";
 
 /**
@@ -1080,6 +1082,14 @@ export class AssembledTransaction<T> {
    *
    * With the default authorizer, the wallet's returned `signerAddress` names
    * the key the signature is verified against, which may differ from `address`.
+   *
+   * Entries may be signed again, including entries that already have signatures.
+   * Each call can prompt the wallet again and refresh the expiration. Signed
+   * delegates pin the entry's stored expiration, which this method preserves.
+   *
+   * @returns the index, address, and expiration of each entry processed
+   * @throws `TypeError` if no top-level entry matches the address, or an explicit
+   * expiration differs from one already committed to by a signed delegate
    */
   signAuthEntries = async ({
     expiration,
@@ -1090,10 +1100,11 @@ export class AssembledTransaction<T> {
     /**
      * When to set each auth entry to expire. Could be any number of blocks in
      * the future. Can be supplied as a promise or a raw number. Default: the
-     * stored expiration of a `SOROBAN_CREDENTIALS_ADDRESS_WITH_DELEGATES`
-     * entry while it lies within the next 100 ledgers, otherwise about 8.3
-     * minutes from now. A different value clears the signatures of the nodes
-     * that already signed (see `authorizeEntry`).
+     * stored expiration when any delegate already carries a signature, even
+     * if it has expired. An explicit different value is rejected. Otherwise,
+     * a delegates entry keeps its expiration within the next 100 ledgers,
+     * or defaults to about 8.3 minutes from now. To refresh an entry pinned by
+     * delegates, obtain new delegate signatures first.
      */
     expiration?: number | Promise<number>;
     /**
@@ -1118,9 +1129,11 @@ export class AssembledTransaction<T> {
      * not forward the wallet's `signerAddress`.
      */
     authorizeEntry?: typeof stellarBaseAuthorizeEntry;
-  } = {}): Promise<void> => {
+  } = {}): Promise<AuthEntrySigningResult[]> => {
     if (!this.built)
-      throw new Error("Transaction has not yet been assembled or simulated");
+      throw new AssembledTransaction.Errors.InvalidClientRequest(
+        "Transaction has not yet been assembled or simulated",
+      );
 
     const derivedAddress = signerAddress(signAuthEntry);
     const address = addressArg ?? derivedAddress ?? this.options.publicKey;
@@ -1150,25 +1163,25 @@ export class AssembledTransaction<T> {
     // Likely if we're using a custom authorizeEntry then we know better than the `needsNonInvokerSigningBy` logic.
     if (authorizeEntry === stellarBaseAuthorizeEntry) {
       // top level only: these are the entries this method can sign
-      const unsigned = this.unsignedAddresses({ includeDelegates: false });
+      const addresses = this.unsignedAddresses({
+        includeAlreadySigned: true,
+        includeDelegates: false,
+      });
       if (
         address !== undefined &&
-        !unsigned.includes(address) &&
-        this.needsNonInvokerSigningBy().includes(address)
+        !addresses.includes(address) &&
+        this.needsNonInvokerSigningBy({ includeAlreadySigned: true }).includes(
+          address,
+        )
       ) {
-        throw new AssembledTransaction.Errors.NoSignatureNeeded(
-          `"${address}" is an unsigned delegate, and \`signAuthEntries\` ` +
+        throw new TypeError(
+          `"${address}" is a delegate, and \`signAuthEntries\` ` +
             "signs top-level addresses only. Sign it with `authorizeEntry` " +
             "and `forAddress`.",
         );
       }
-      if (unsigned.length === 0) {
-        throw new AssembledTransaction.Errors.NoUnsignedNonInvokerAuthEntries(
-          "No unsigned non-invoker auth entries; maybe you already signed?",
-        );
-      }
-      if (unsigned.indexOf(address ?? "") === -1) {
-        throw new AssembledTransaction.Errors.NoSignatureNeeded(noEntriesFor());
+      if (!addresses.includes(address ?? "")) {
+        throw new TypeError(noEntriesFor());
       }
       if (!signAuth) {
         throw new AssembledTransaction.Errors.NoSigner(
@@ -1181,7 +1194,42 @@ export class AssembledTransaction<T> {
       .operations[0] as Operation.InvokeHostFunction;
 
     const authEntries = rawInvokeHostFunctionOp.auth ?? [];
-    let signedAny = false;
+    const results: AuthEntrySigningResult[] = [];
+    const explicitExpiration = await expiration;
+    const hasSignedDelegate = (
+      delegates: SorobanDelegateSignature[],
+    ): boolean =>
+      delegates.some(
+        (delegate) =>
+          signaturePresent(delegate.signature) ||
+          hasSignedDelegate(delegate.nestedDelegates),
+      );
+    const pinnedExpiration = (
+      credentials: SorobanCredentials,
+    ): number | undefined =>
+      credentials.type === "sorobanCredentialsAddressWithDelegates" &&
+      hasSignedDelegate(credentials.addressWithDelegates.delegates)
+        ? credentials.addressWithDelegates.addressCredentials
+            .signatureExpirationLedger
+        : undefined;
+
+    // Validate every selected entry before prompting a wallet or replacing entries.
+    if (explicitExpiration !== undefined) {
+      for (const entry of authEntries) {
+        const credentials = getAddressCredentials(entry.credentials);
+        if (
+          credentials === null ||
+          Address.fromScAddress(credentials.address).toString() !== address
+        )
+          continue;
+        const pinned = pinnedExpiration(entry.credentials);
+        if (pinned !== undefined && explicitExpiration !== pinned) {
+          throw new TypeError(
+            `Expiration ${explicitExpiration} differs from stored expiration ${pinned} committed to by delegate signatures`,
+          );
+        }
+      }
+    }
 
     // Fetched once, and only for an entry that gets the default.
     let latestLedger: Promise<number> | undefined;
@@ -1222,6 +1270,13 @@ export class AssembledTransaction<T> {
 
       const sign: SignAuthEntry = signAuth ?? Promise.resolve;
 
+      const entryExpiration =
+        explicitExpiration ??
+        pinnedExpiration(credentials) ??
+        (await defaultExpiration(
+          credentials,
+          addrAuth.signatureExpirationLedger,
+        ));
       authEntries[i] = await authorizeEntry(
         entry,
         async (preimage) => {
@@ -1242,17 +1297,21 @@ export class AssembledTransaction<T> {
             ? signature
             : { signature, publicKey: signingKey };
         },
-        await (expiration ??
-          defaultExpiration(credentials, addrAuth.signatureExpirationLedger)),
+        entryExpiration,
         this.options.networkPassphrase,
       );
-      signedAny = true;
+      results.push({
+        index: i,
+        address: authEntryAddress,
+        expiration: entryExpiration,
+      });
     }
 
     // A custom authorizer skips the pre-flight, so catch a no-match here.
-    if (!signedAny) {
-      throw new AssembledTransaction.Errors.NoSignatureNeeded(noEntriesFor());
+    if (results.length === 0) {
+      throw new TypeError(noEntriesFor());
     }
+    return results;
   };
 
   /**

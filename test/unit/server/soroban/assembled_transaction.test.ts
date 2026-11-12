@@ -622,11 +622,12 @@ describe("AssembledTransaction auth entry credential types (CAP-71)", () => {
   function addrCreds(
     pk: string,
     signed = false,
+    expiration = 0,
   ): xdr.SorobanAddressCredentials {
     return new xdr.SorobanAddressCredentials({
       address: new Address(pk).toScAddress(),
       nonce: 1n,
-      signatureExpirationLedger: 0,
+      signatureExpirationLedger: expiration,
       signature: signed
         ? xdr.ScVal.scvVec([xdr.ScVal.scvBytes(new Uint8Array(64))])
         : xdr.ScVal.scvVoid(),
@@ -802,11 +803,16 @@ describe("AssembledTransaction auth entry credential types (CAP-71)", () => {
           : xdr.ScVal.scvVoid(),
         nestedDelegates: nested.map(delegate),
       });
-    const delegatesEntry = (top: string, delegates: Node[], signed = false) =>
+    const delegatesEntry = (
+      top: string,
+      delegates: Node[],
+      signed = false,
+      expiration = 0,
+    ) =>
       authEntry(
         xdr.SorobanCredentials.sorobanCredentialsAddressWithDelegates(
           new xdr.SorobanAddressCredentialsWithDelegates({
-            addressCredentials: addrCreds(top, signed),
+            addressCredentials: addrCreds(top, signed, expiration),
             delegates: delegates.map(delegate),
           }),
         ),
@@ -943,8 +949,8 @@ describe("AssembledTransaction auth entry credential types (CAP-71)", () => {
             .signAuthEntry,
         }),
       ).rejects.toThrow(
-        new contract.AssembledTransaction.Errors.NoSignatureNeeded(
-          `"${kpC.publicKey()}" is an unsigned delegate, and \`signAuthEntries\` ` +
+        new TypeError(
+          `"${kpC.publicKey()}" is a delegate, and \`signAuthEntries\` ` +
             "signs top-level addresses only. Sign it with `authorizeEntry` " +
             "and `forAddress`.",
         ),
@@ -1011,57 +1017,28 @@ describe("AssembledTransaction auth entry credential types (CAP-71)", () => {
         return expectDefined(operation.auth);
       };
 
-      it("keeps the expiration a delegate already signed for while it lies within the default window", async () => {
-        const { assembled, getLatestLedger } = setup([
-          await delegateSignedAt(5050),
-        ]);
+      it.each([5050, 6000, 1000])(
+        "preserves a signed delegate's stored expiration %i regardless of the latest ledger",
+        async (expiration) => {
+          const { assembled, getLatestLedger } = setup([
+            await delegateSignedAt(expiration),
+          ]);
 
-        await assembled.signAuthEntries({ signAuthEntry });
+          await expect(
+            assembled.signAuthEntries({ signAuthEntry }),
+          ).resolves.toEqual([
+            { index: 0, address: kpA.publicKey(), expiration },
+          ]);
 
-        const [entry] = signedAuth(assembled);
-        expect(
-          StellarSdk.inspectAuthEntry(entry).signatureExpirationLedger,
-        ).toBe(5050);
-        expect(verifiesAtStored(entry, kpA, networkPassphrase)).toBe(true);
-        expect(verifiesAtStored(entry, kpB, networkPassphrase)).toBe(true);
-        expect(getLatestLedger).toHaveBeenCalledTimes(1);
-      });
-
-      it("refreshes a delegates entry whose stored expiration is past the default window", async () => {
-        // the default never commits further ahead than latest + 100; pass
-        // `expiration` to keep a longer window
-        const { assembled, getLatestLedger } = setup([
-          await delegateSignedAt(6000),
-        ]);
-
-        await assembled.signAuthEntries({ signAuthEntry });
-
-        const [entry] = signedAuth(assembled);
-        const info = StellarSdk.inspectAuthEntry(entry);
-        expect(info.signatureExpirationLedger).toBe(LATEST + 100);
-        expect(
-          info.signers.filter((s) => s.signed).map((s) => s.address),
-        ).toEqual([kpA.publicKey()]);
-        expect(getLatestLedger).toHaveBeenCalledTimes(1);
-      });
-
-      it("refreshes a delegates entry whose stored expiration is behind the latest ledger", async () => {
-        // the delegate's signature is expired anyway, so it is cleared and
-        // listed for signing again
-        const { assembled, getLatestLedger } = setup([
-          await delegateSignedAt(1000),
-        ]);
-
-        await assembled.signAuthEntries({ signAuthEntry });
-
-        const [entry] = signedAuth(assembled);
-        const info = StellarSdk.inspectAuthEntry(entry);
-        expect(info.signatureExpirationLedger).toBe(LATEST + 100);
-        expect(
-          info.signers.filter((s) => s.signed).map((s) => s.address),
-        ).toEqual([kpA.publicKey()]);
-        expect(getLatestLedger).toHaveBeenCalledTimes(1);
-      });
+          const [entry] = signedAuth(assembled);
+          expect(
+            StellarSdk.inspectAuthEntry(entry).signatureExpirationLedger,
+          ).toBe(expiration);
+          expect(verifiesAtStored(entry, kpA, networkPassphrase)).toBe(true);
+          expect(verifiesAtStored(entry, kpB, networkPassphrase)).toBe(true);
+          expect(getLatestLedger).not.toHaveBeenCalled();
+        },
+      );
 
       it("keeps a different stored expiration on each entry", async () => {
         const { assembled } = setup([
@@ -1099,6 +1076,27 @@ describe("AssembledTransaction auth entry credential types (CAP-71)", () => {
         expect(getLatestLedger).toHaveBeenCalledTimes(1);
       });
 
+      it("refreshes stored expiration when delegates have no signatures", async () => {
+        const entry = delegatesEntry(
+          kpA.publicKey(),
+          [{ address: kpB.publicKey() }],
+          false,
+          6000,
+        );
+
+        const { assembled, getLatestLedger } = setup([entry]);
+
+        await expect(
+          assembled.signAuthEntries({ signAuthEntry }),
+        ).resolves.toEqual([
+          { index: 0, address: kpA.publicKey(), expiration: LATEST + 100 },
+        ]);
+        expect(getLatestLedger).toHaveBeenCalledOnce();
+        expect(
+          verifiesAtStored(signedAuth(assembled)[0], kpA, networkPassphrase),
+        ).toBe(true);
+      });
+
       it("refreshes a signed ADDRESS_V2 entry with the latest ledger + 100", async () => {
         const signedEarlier = await StellarSdk.authorizeEntry(
           authEntry(addressV2Cred(kpA.publicKey())),
@@ -1121,21 +1119,97 @@ describe("AssembledTransaction auth entry credential types (CAP-71)", () => {
         expect(getLatestLedger).toHaveBeenCalledTimes(1);
       });
 
-      it("applies an explicit expiration to every entry", async () => {
+      it("accepts an explicit matching expiration without clearing delegate signatures", async () => {
         const { assembled, getLatestLedger } = setup([
           await delegateSignedAt(1000),
         ]);
 
-        await assembled.signAuthEntries({ expiration: 2000, signAuthEntry });
+        await expect(
+          assembled.signAuthEntries({
+            expiration: Promise.resolve(1000),
+            signAuthEntry,
+          }),
+        ).resolves.toEqual([
+          { index: 0, address: kpA.publicKey(), expiration: 1000 },
+        ]);
 
         const [entry] = signedAuth(assembled);
-        const info = StellarSdk.inspectAuthEntry(entry);
-        expect(info.signatureExpirationLedger).toBe(2000);
-        expect(
-          info.signers.filter((s) => s.signed).map((s) => s.address),
-        ).toEqual([kpA.publicKey()]);
+        expect(verifiesAtStored(entry, kpA, networkPassphrase)).toBe(true);
+        expect(verifiesAtStored(entry, kpB, networkPassphrase)).toBe(true);
         expect(getLatestLedger).not.toHaveBeenCalled();
       });
+
+      it("rejects a differing explicit expiration before any wallet call, even for a later entry", async () => {
+        const { assembled, getLatestLedger } = setup([
+          authEntry(addressV2Cred(kpA.publicKey())),
+          await delegateSignedAt(1000),
+        ]);
+        const wallet = vi.fn(signAuthEntry);
+        const before = signedAuth(assembled).map((entry) => entry.toXdr());
+
+        await expect(
+          assembled.signAuthEntries({
+            expiration: Promise.resolve(2000),
+            signAuthEntry: wallet,
+          }),
+        ).rejects.toThrow(TypeError);
+
+        expect(wallet).not.toHaveBeenCalled();
+        expect(getLatestLedger).not.toHaveBeenCalled();
+        expect(signedAuth(assembled).map((entry) => entry.toXdr())).toEqual(
+          before,
+        );
+      });
+
+      it.each([undefined, 1000, 2000])(
+        "protects a nested delegate signature with explicit expiration %s",
+        async (expiration) => {
+          // Presence, not cryptographic validity, protects a delegate signature.
+          const entry = delegatesEntry(
+            kpA.publicKey(),
+            [
+              {
+                address: accountC,
+                nested: [{ address: kpB.publicKey(), signed: true }],
+              },
+            ],
+            false,
+            1000,
+          );
+          const credentials = expectVariant(
+            entry.credentials,
+            "sorobanCredentialsAddressWithDelegates",
+          ).addressWithDelegates;
+
+          const { assembled, getLatestLedger } = setup([entry]);
+          const wallet = vi.fn(signAuthEntry);
+          const nestedSignature =
+            credentials.delegates[0].nestedDelegates[0].signature.toXdr();
+          const signing = assembled.signAuthEntries({
+            expiration,
+            signAuthEntry: wallet,
+          });
+
+          if (expiration === 2000) {
+            await expect(signing).rejects.toThrow(TypeError);
+            expect(wallet).not.toHaveBeenCalled();
+          } else {
+            await expect(signing).resolves.toEqual([
+              { index: 0, address: kpA.publicKey(), expiration: 1000 },
+            ]);
+            expect(wallet).toHaveBeenCalledOnce();
+            const [signed] = signedAuth(assembled);
+            expect(
+              expectVariant(
+                signed.credentials,
+                "sorobanCredentialsAddressWithDelegates",
+              ).addressWithDelegates.delegates[0].nestedDelegates[0].signature.toXdr(),
+            ).toEqual(nestedSignature);
+            expect(verifiesAtStored(signed, kpA, networkPassphrase)).toBe(true);
+          }
+          expect(getLatestLedger).not.toHaveBeenCalled();
+        },
+      );
     });
 
     describe("sign()", () => {
@@ -1232,6 +1306,118 @@ describe("AssembledTransaction auth entry credential types (CAP-71)", () => {
   });
 
   describe("signAuthEntries", () => {
+    it.each([false, true])(
+      "keeps NoSigner for a matching entry (already signed: %s)",
+      async (signed) => {
+        const assembled = assembledWith(
+          [authEntry(addressV2Cred(kpA.publicKey(), signed))],
+          { publicKey: kpA.publicKey() },
+        );
+        await expect(
+          assembled.signAuthEntries({ expiration: 1000 }),
+        ).rejects.toThrow(contract.AssembledTransaction.Errors.NoSigner);
+      },
+    );
+
+    it.each([
+      ["ADDRESS", addressCred],
+      ["ADDRESS_V2", addressV2Cred],
+      ["ADDRESS_WITH_DELEGATES", withDelegatesCred],
+    ] as const)(
+      "re-signs fully signed %s entries repeatedly",
+      async (_name, makeCredentials) => {
+        const signAuthEntry = vi.fn(
+          contract.basicNodeSigner(kpA, networkPassphrase).signAuthEntry,
+        );
+        const assembled = assembledWith(
+          [
+            await StellarSdk.authorizeEntry(
+              authEntry(makeCredentials(kpA.publicKey())),
+              kpA,
+              1000,
+              networkPassphrase,
+            ),
+          ],
+          { publicKey: kpA.publicKey(), signAuthEntry },
+        );
+
+        expect(assembled.needsNonInvokerSigningBy()).toEqual([]);
+        for (const expiration of [2000, 3000]) {
+          await expect(
+            assembled.signAuthEntries({ expiration }),
+          ).resolves.toEqual([
+            { index: 0, address: kpA.publicKey(), expiration },
+          ]);
+          const operation = expectDefined(assembled.built).operations[0];
+          if (operation.type !== "invokeHostFunction")
+            throw new Error("Expected an invokeHostFunction operation");
+          const [entry] = expectDefined(operation.auth);
+          expect(
+            StellarSdk.inspectAuthEntry(entry).signatureExpirationLedger,
+          ).toBe(expiration);
+          expect(verifiesAtStored(entry, kpA, networkPassphrase)).toBe(true);
+        }
+        expect(signAuthEntry).toHaveBeenCalledTimes(2);
+      },
+    );
+
+    it("returns only signed entries with their original indices in a mixed signed/unsigned transaction", async () => {
+      const signAuthEntry = vi.fn(
+        contract.basicNodeSigner(kpA, networkPassphrase).signAuthEntry,
+      );
+      const other = authEntry(addressV2Cred(kpB.publicKey()));
+      const assembled = assembledWith(
+        [
+          authEntry(sourceCred()),
+          await StellarSdk.authorizeEntry(
+            authEntry(addressV2Cred(kpA.publicKey())),
+            kpA,
+            1000,
+            networkPassphrase,
+          ),
+          other,
+          authEntry(withDelegatesCred(kpA.publicKey())),
+        ],
+        { publicKey: kpA.publicKey(), signAuthEntry },
+      );
+
+      await expect(
+        assembled.signAuthEntries({ expiration: 2000 }),
+      ).resolves.toEqual([
+        { index: 1, address: kpA.publicKey(), expiration: 2000 },
+        { index: 3, address: kpA.publicKey(), expiration: 2000 },
+      ]);
+      expect(signAuthEntry).toHaveBeenCalledTimes(2);
+      const operation = expectDefined(assembled.built).operations[0];
+      if (operation.type !== "invokeHostFunction")
+        throw new Error("Expected an invokeHostFunction operation");
+      const entries = expectDefined(operation.auth);
+      expect(entries[2].toXdr()).toEqual(other.toXdr());
+      expect(verifiesAtStored(entries[1], kpA, networkPassphrase)).toBe(true);
+      expect(verifiesAtStored(entries[3], kpA, networkPassphrase)).toBe(true);
+    });
+
+    it.each([
+      { entries: [] },
+      { entries: [authEntry(sourceCred())] },
+      { entries: [authEntry(addressV2Cred(kpB.publicKey(), true))] },
+    ])(
+      "rejects no matching top-level entry with TypeError: $entries",
+      async ({ entries }) => {
+        const signAuthEntry = vi.fn(
+          contract.basicNodeSigner(kpA, networkPassphrase).signAuthEntry,
+        );
+        const assembled = assembledWith(entries, {
+          publicKey: kpA.publicKey(),
+          signAuthEntry,
+        });
+        await expect(
+          assembled.signAuthEntries({ expiration: 1000 }),
+        ).rejects.toThrow(TypeError);
+        expect(signAuthEntry).not.toHaveBeenCalled();
+      },
+    );
+
     it("authorizes ADDRESS_V2 and ADDRESS_WITH_DELEGATES entries for the target address, skipping source account and other addresses", async () => {
       const assembled = assembledWith([
         authEntry(addressV2Cred(kpA.publicKey())), // matches -> authorized
@@ -1242,11 +1428,16 @@ describe("AssembledTransaction auth entry credential types (CAP-71)", () => {
 
       const authorizeEntry = vi.fn((entry: any) => Promise.resolve(entry));
 
-      await assembled.signAuthEntries({
-        expiration: 1000,
-        address: kpA.publicKey(),
-        authorizeEntry,
-      });
+      await expect(
+        assembled.signAuthEntries({
+          expiration: 1000,
+          address: kpA.publicKey(),
+          authorizeEntry,
+        }),
+      ).resolves.toEqual([
+        { index: 0, address: kpA.publicKey(), expiration: 1000 },
+        { index: 1, address: kpA.publicKey(), expiration: 1000 },
+      ]);
 
       expect(authorizeEntry).toHaveBeenCalledTimes(2);
       const authorized = authorizeEntry.mock.calls.map(([entry]) =>
@@ -1578,7 +1769,7 @@ describe("AssembledTransaction auth entry credential types (CAP-71)", () => {
       await expect(
         assembled.signAuthEntries({ expiration: 1000 }),
       ).rejects.toThrow(
-        new contract.AssembledTransaction.Errors.NoSignatureNeeded(
+        new TypeError(
           `No auth entries for public key "${kpA.publicKey()}"; \`address\` ` +
             "was not given and `signAuthEntry` does not name one, so it " +
             "defaulted to the account that built this transaction. Pass " +
@@ -1621,9 +1812,7 @@ describe("AssembledTransaction auth entry credential types (CAP-71)", () => {
           authorizeEntry: (entry) => Promise.resolve(entry),
         }),
       ).rejects.toThrow(
-        new contract.AssembledTransaction.Errors.NoSignatureNeeded(
-          `No auth entries for public key "${kpA.publicKey()}"`,
-        ),
+        new TypeError(`No auth entries for public key "${kpA.publicKey()}"`),
       );
     });
 
@@ -1640,7 +1829,7 @@ describe("AssembledTransaction auth entry credential types (CAP-71)", () => {
           authorizeEntry: (entry) => Promise.resolve(entry),
         }),
       ).rejects.toThrow(
-        new contract.AssembledTransaction.Errors.NoSignatureNeeded(
+        new TypeError(
           "No account to sign for: `address` was not given and `signAuthEntry` " +
             "does not name one. Pass `address` to say who is signing.",
         ),
